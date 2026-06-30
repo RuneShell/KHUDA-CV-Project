@@ -5,7 +5,7 @@ from datetime import datetime
 
 class Logger:
     # logger = Logger("", __name__)
-    def __init__(self, log_dir, runner_name):
+    def __init__(self, log_dir="logs", runner_name = "runner"):
         self.runner_name = runner_name
 
         os.makedirs(log_dir, exist_ok=True)
