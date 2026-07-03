@@ -1,3 +1,5 @@
+# version 1
+
 import os
 import gc
 import numpy as np
@@ -14,16 +16,14 @@ from utils.logger import Logger
 # 0. Custom Vars
 #######################
 
-BASE_DIR = "/data2/local_datasets/173_dataset/"
-TRAIN_DIR = os.path.join(BASE_DIR, "train") # 1152 + 384
-TEST_DIR = os.path.join(BASE_DIR, "val") # 144 + 48
+BASE_DIR = "/data/leecg1219/173_dataset/"
+MANIFEST_DIR = "/data/leecg1219/KHUDA_173/processed_173_manifest/manifests"
 
 LEARNING_RATE1 = 1e-3
 LEARNING_RATE2 = 1e-4
 LEARNING_RATE3 = 1e-5
-EPOCHS = 100
-BATCH_SIZE = 16
-STAGE3_BATCH_SIZE = 4
+EPOCHS = 12
+BATCH_SIZE = 4
 DEVICE = "cuda"
 
 CLIP_LEN = 48
@@ -115,16 +115,21 @@ def train():
     logger.timestamp(f"Model loaded: {model.__class__.__name__}")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    mydataset = MyDataset('train', 
-                        BASE_PATH=BASE_DIR,
-                        BATCH_SIZE=BATCH_SIZE, image_size=IMAGE_SIZE, num_frames=CLIP_LEN)
+    mydataset = MyDataset(
+        mode="train",
+        BASE_PATH=BASE_DIR,
+        BATCH_SIZE=BATCH_SIZE,
+        image_size=IMAGE_SIZE,
+        num_frames=CLIP_LEN,
+        manifest_dir=MANIFEST_DIR,
+    )
     train_loader, val_loader = mydataset.get_train_dataset()
 
     #optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
     clip_loss = torch.nn.BCEWithLogitsLoss()
     frame_loss = torch.nn.BCEWithLogitsLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
+    scaler = torch.amp.GradScaler(device=DEVICE, enabled=(DEVICE == "cuda"))
 
 
     # ==== training loop ====
@@ -136,21 +141,17 @@ def train():
             optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE1, weight_decay=1e-4)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
         
-        elif epoch == 3:
+        elif epoch == 2:
             logger.timestamp("Stage 2")
             model.unfreeze_last_layers(num_layers=1)  # backbone의 마지막 layer + heads 학습
             optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE2, weight_decay=1e-4)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
-        elif epoch == 10:
+        elif epoch == 7:
             logger.timestamp("Stage 3")
             model.unfreeze_all()  # 전체 학습
             optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE3, weight_decay=1e-4)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
-            train_loader, val_loader = mydataset.get_train_dataset(
-                train_batch_size=STAGE3_BATCH_SIZE,
-                val_batch_size=STAGE3_BATCH_SIZE,
-            )
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

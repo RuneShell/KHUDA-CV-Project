@@ -1,4 +1,5 @@
 # transforms.py
+# version 2
 
 import json
 import os
@@ -7,11 +8,16 @@ import random
 import decord
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.v2 as TT
+from torch.utils.data import DataLoader, Dataset
+
+from dataset import GarbageDumpingClipDataset
 
 
 VIDEO_EXTENSIONS = {".mp4"}
+DEFAULT_MANIFEST_DIR = "/data/leecg1219/KHUDA_173/processed_173_manifest/manifests"
+DEFAULT_TRAIN_MANIFEST = "clips_train_v2.json"
+DEFAULT_VAL_MANIFEST = "clips_val_v2.json"
 
 
 def _resolve_label_json_path(video_path, clip_label):
@@ -64,19 +70,35 @@ def _load_frame_annotations(label_json_path, total_frames):
     return None
 
 
-class _ClipDataset(Dataset):
-    def __init__(self, VIDEO_PATH, transform, num_frames):
-        self.VIDEO_PATH = VIDEO_PATH
+def _video_batch_to_tensor(batch):
+    if hasattr(batch, "asnumpy"):
+        batch = batch.asnumpy()
+    elif isinstance(batch, torch.Tensor):
+        batch = batch.detach().cpu().numpy()
+    return torch.from_numpy(batch)
+
+
+class _FolderClipDataset(Dataset):
+    def __init__(self, split_root, transform, num_frames):
+        self.split_root = split_root
         self.transform = transform
         self.num_frames = num_frames
         self.clips = []
 
         for class_name, label in [("legal", 0), ("illegal", 1)]:
-            class_dir = os.path.join(VIDEO_PATH, class_name)
+            class_dir = os.path.join(split_root, "video", class_name)
+            if not os.path.isdir(class_dir):
+                continue
             for name in sorted(os.listdir(class_dir)):
                 path = os.path.join(class_dir, name)
                 ext = os.path.splitext(name)[1].lower()
                 if os.path.isfile(path) and ext in VIDEO_EXTENSIONS:
+                    try:
+                        vr = decord.VideoReader(path)
+                        if len(vr) == 0:
+                            continue
+                    except Exception:
+                        continue
                     self.clips.append({
                         "video_path": path,
                         "label": label,
@@ -95,7 +117,7 @@ class _ClipDataset(Dataset):
         ids = np.linspace(0, total_frames - 1, num=self.num_frames)
         ids = np.round(ids).astype(np.int64)
 
-        frames = torch.from_numpy(vr.get_batch(ids).asnumpy()).permute(0, 3, 1, 2)
+        frames = _video_batch_to_tensor(vr.get_batch(ids)).permute(0, 3, 1, 2)
         frames = self.transform(frames)
 
         clip_label = torch.tensor(float(clip_item["label"]), dtype=torch.float32)
@@ -116,16 +138,16 @@ class _ClipDataset(Dataset):
 
 
 class MyDataset:
-    def __init__(self, mode, BASE_PATH, BATCH_SIZE, image_size, num_frames, frame_stride=3):
-
+    def __init__(self, mode, BASE_PATH, BATCH_SIZE, image_size, num_frames, frame_stride=3,
+                 manifest_dir=DEFAULT_MANIFEST_DIR, video_root=None):
         self.mode = mode
         self.BATCH_SIZE = BATCH_SIZE
         self.image_size = image_size
         self.num_frames = num_frames
         self.frame_stride = frame_stride
-
-        self.TRAIN_VIDEO = os.path.join(BASE_PATH, "train", "video")
-        self.VAL_VIDEO = os.path.join(BASE_PATH, "val", "video")
+        self.BASE_PATH = BASE_PATH
+        self.manifest_dir = manifest_dir
+        self.video_root = video_root
 
         self.MEAN = [0.485, 0.456, 0.406]
         self.STD = [0.229, 0.224, 0.225]
@@ -135,41 +157,91 @@ class MyDataset:
         os.environ["PYTHONHASHSEED"] = str(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
         self.train_transform = TT.Compose([
-            TT.ToDtype(torch.float32, scale=True),
             TT.RandomResizedCrop(self.image_size, scale=(0.7, 1.0), antialias=True),
             TT.RandomHorizontalFlip(p=0.5),
             TT.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            TT.Normalize(mean=self.MEAN, std=self.STD),
         ])
 
         self.val_transform = TT.Compose([
-            TT.ToDtype(torch.float32, scale=True),
             TT.Resize(self.image_size, antialias=True),
             TT.CenterCrop(self.image_size),
-            TT.Normalize(mean=self.MEAN, std=self.STD),
         ])
+
+    def _manifest_path(self, filename):
+        return os.path.join(self.manifest_dir, filename)
+
+    def _tuple_collate_fn(self, batch):
+        frames = torch.stack([item[0] for item in batch])
+        clip_labels = torch.stack([item[1] for item in batch])
+        frame_labels = torch.stack([item[2] for item in batch])
+        return frames, clip_labels, frame_labels
+
+    def _build_manifest_dataset(self, manifest_path, split, train_augment=None):
+        return GarbageDumpingClipDataset(
+            manifest_path,
+            split=split,
+            num_frames=self.num_frames,
+            image_size=self.image_size,
+            train_augment=train_augment,
+            video_root=self.video_root,
+        )
 
     def get_train_dataset(self, train_batch_size=None, val_batch_size=None):
         train_batch_size = self.BATCH_SIZE if train_batch_size is None else train_batch_size
         val_batch_size = self.BATCH_SIZE if val_batch_size is None else val_batch_size
 
-        train_set = _ClipDataset(
-            self.TRAIN_VIDEO,
-            self.train_transform,
-            self.num_frames,
-        )
+        train_manifest = self._manifest_path(DEFAULT_TRAIN_MANIFEST)
+        val_manifest = self._manifest_path(DEFAULT_VAL_MANIFEST)
 
-        val_set = _ClipDataset(
-            self.VAL_VIDEO,
-            self.val_transform,
-            self.num_frames,
+        if os.path.exists(train_manifest) and os.path.exists(val_manifest):
+            train_set = self._build_manifest_dataset(
+                train_manifest,
+                split="train",
+                train_augment=self.train_transform,
+            )
+            val_set = self._build_manifest_dataset(
+                val_manifest,
+                split="val",
+                train_augment=None,
+            )
+        else:
+            train_set = _FolderClipDataset(
+                os.path.join(self.BASE_PATH, "train"),
+                TT.Compose([
+                    TT.ToDtype(torch.float32, scale=True),
+                    self.train_transform,
+                    TT.Normalize(mean=self.MEAN, std=self.STD),
+                ]),
+                self.num_frames,
+            )
+            val_set = _FolderClipDataset(
+                os.path.join(self.BASE_PATH, "val"),
+                TT.Compose([
+                    TT.ToDtype(torch.float32, scale=True),
+                    self.val_transform,
+                    TT.Normalize(mean=self.MEAN, std=self.STD),
+                ]),
+                self.num_frames,
+            )
+
+        train_loader = DataLoader(
+            train_set,
+            batch_size=train_batch_size,
+            shuffle=True,
+            pin_memory=True,
+            collate_fn=self._tuple_collate_fn,
         )
-        train_loader = DataLoader(train_set, batch_size=train_batch_size,
-                                    shuffle=True, pin_memory=True)
-        val_loader = DataLoader(val_set, batch_size=val_batch_size,
-                                shuffle=False, pin_memory=True)
+        val_loader = DataLoader(
+            val_set,
+            batch_size=val_batch_size,
+            shuffle=False,
+            pin_memory=True,
+            collate_fn=self._tuple_collate_fn,
+        )
         return train_loader, val_loader

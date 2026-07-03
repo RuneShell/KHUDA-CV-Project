@@ -1,38 +1,58 @@
 import os
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
+
 import torch
 import decord
 import torchvision.transforms.v2 as TT
 import scipy.ndimage
 
 from models.model import VideoMAEMultiHead
+
+
+#####################
+# Configuration
+#####################
 BASE_DIR = ""
-VIDEO_PATH = os.path.join(BASE_DIR, ".mp4")
+VIDEO_PATH = os.path.join(BASE_DIR, "C_30_3_smp_su_09-11_16-23-00_a_aft_DF2.mp4")
 SAVE_PATH = os.path.join(BASE_DIR, "result.mp4")
 
 CLIP_LEN = 48
 IMAGE_SIZE = 224
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CHECKPOINT_PATH = ""  # ???: 사용할 가중치 파일 경로
+DEVICE = "cuda"
+# CHECKPOINT_PATH = ""  # ???: 사용할 가중치 파일 경로
 
+from dataset import GarbageDumpingClipDataset
+ds = GarbageDumpingClipDataset("/data/leecg1219/KHUDA_173/processed_173_manifest/manifests/clips_test_v2.json", 
+                               split="test", 
+                               video_root="/data/philipn337/KHUDA_173/raw/extracted/173/videos")
+
+
+# 채경님 model 로드
+from models.model import GarbageDumpingVideoMAE
+model = GarbageDumpingVideoMAE()
+ckpt = torch.load(
+    "/data/leecg1219/KHUDA_173/checkpoints/best_model.pt",
+    map_location="cuda"
+)
+
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval()
+
+
+########################
+# load video
 cap = cv2.VideoCapture(VIDEO_PATH)
-
+# video properties
 fps = cap.get(cv2.CAP_PROP_FPS)
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-total_frames_cv = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-writer = cv2.VideoWriter(
-    SAVE_PATH,
-    cv2.VideoWriter_fourcc(*"mp4v"),
-    fps,
-    (width, height)
-)
-
 
 
 ####################
 ## test code here
+###################
 vr = decord.VideoReader(VIDEO_PATH)
 total_frames = len(vr)
 
@@ -50,15 +70,8 @@ val_transform = TT.Compose([
 
 input_tensor = val_transform(frames).unsqueeze(0).to(DEVICE) # (1, T, C, H, W)
 
-#모델 로드 및 Hook 설정
 
-model = VideoMAEMultiHead(pretrained="MCG-NJU/videomae-base", num_frames=CLIP_LEN).to(DEVICE)
-
-if os.path.exists(CHECKPOINT_PATH):
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
-
+# 모델 및 Hook 설정
 for p in model.backbone.parameters():
     p.requires_grad = True
 
@@ -74,10 +87,17 @@ def backward_hook(module, grad_input, grad_output):
 handle_fw = target_layer.register_forward_hook(forward_hook)
 handle_bw = target_layer.register_full_backward_hook(backward_hook)
 
-# Forward & Backward (Grad-CAM 추출)
 
+# Forward & Backward (Grad-CAM 추출)
 clip_logit, frame_logits = model(input_tensor)
 model.zero_grad()
+# debugging
+clip_score = torch.sigmoid(clip_logit[0]).item()
+frame_scores = torch.sigmoid(frame_logits[0]).detach().cpu().numpy()
+print("clip_logit shape:", tuple(clip_logit.shape))
+print("frame_logits shape:", tuple(frame_logits.shape))
+print("clip_score:", clip_score)
+print("frame_scores shape:", frame_scores.shape)
 
 score = clip_logit[0]
 score.backward()
@@ -97,62 +117,43 @@ h_tokens = IMAGE_SIZE // 16
 w_tokens = IMAGE_SIZE // 16         
 
 cam = cam.view(t_tokens, h_tokens, w_tokens).cpu().numpy()
-
+# 0-1 min-max normalization & resize to original video size
 cam_min, cam_max = cam.min(), cam.max()
 if cam_max > cam_min:
     cam = (cam - cam_min) / (cam_max - cam_min)
 
-zoom_t = total_frames_cv / t_tokens
+zoom_t = total_frames / t_tokens
 grayscale_cam = scipy.ndimage.zoom(cam, (zoom_t, 1, 1), order=1)
 grayscale_cam = np.clip(grayscale_cam, 0, 1)
-####################
-    
-# TODO
-# 영상이랑 model 불러오기
-# 영상에 transform 적용해서 tensor로 만들기
-# model에 넣어서 grad-cam 구하기
-
-
-
-
-
-
-
-##  finally, grad-cam data
 
 
 #####################
 ## YOLO & BoT-SORT here (나중에)
 #####################
 
-
+# 추가할 예정
 
 
 #####################
 ## visualization here
 #####################
 
-
+writer = cv2.VideoWriter(
+    SAVE_PATH,
+    cv2.VideoWriter_fourcc(*"mp4v"),
+    fps,
+    (width, height)
+)
 frame_idx = 0
 while True:
     ret, frame = cap.read()
-
-    if not ret:
+    if not ret or frame_idx >= len(grayscale_cam):
         break
-
-    if frame_idx >= len(grayscale_cam): # ?
-        break
-
-
 
 
     # get grad-cam
     cam = grayscale_cam[frame_idx]
-
-    # 0~255
     cam = np.uint8(255 * cam)
-
-    # 영상 크기로 resize
     cam = cv2.resize(cam, (width, height))
 
     # Heatmap
@@ -167,34 +168,48 @@ while True:
         0
     )
 
-    # bbox
-    cv2.rectangle(
-        overlay,
-        (x1, y1),
-        (x2, y2),
-        (0,255,0),
-        2
+    score_idx = min(
+        int(frame_idx * len(frame_scores) / max(1, len(grayscale_cam))),
+        len(frame_scores) - 1,
     )
-
-    # ID
     cv2.putText(
         overlay,
-        f"ID {track_id}",
-        (x1, y1-10),
+        f"clip={clip_score:.3f} frame={frame_scores[score_idx]:.3f}",
+        (20, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0,255,0),
-        2
+        0.8,
+        (255, 255, 255),
+        2,
     )
-    writer.write(overlay)
 
+    #= Yolo bbox =
+    # cv2.rectangle(
+    #     overlay,
+    #     (x1, y1),
+    #     (x2, y2),
+    #     (0,255,0),
+    #     2
+    # )
+    # = tracking ID =
+    # cv2.putText(
+    #     overlay,
+    #     f"ID {track_id}",
+    #     (x1, y1-10),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.6,
+    #     (0,255,0),
+    #     2
+    # )
+
+
+    writer.write(overlay)
     frame_idx += 1
+
 
 cap.release()
 writer.release()
-
 print("Saved:", SAVE_PATH)
 
 
 
-# 
+# 추후 task : Gradio | streamlit으로 시각화.
