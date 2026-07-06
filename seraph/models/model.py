@@ -5,6 +5,10 @@ import torch.nn as nn
 from transformers import VideoMAEModel
 
 
+VIDEOMAE_CHECKPOINT = "MCG-NJU/videomae-base-finetuned-kinetics"
+
+
+
 class VideoMAEMultiHead(nn.Module):
     def __init__(self, pretrained, num_frames):
         super().__init__()

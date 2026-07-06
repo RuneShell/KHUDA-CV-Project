@@ -4,39 +4,37 @@ import time
 from datetime import datetime
 
 class Logger:
-    # logger = Logger("", __name__)
-    def __init__(self, log_dir="logs", runner_name = "runner"):
+    def __init__(self, log_dir="logs", runner_name = "runner", mode="discord"):
         self.runner_name = runner_name
 
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f"{self.runner_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        self.mode = mode
+        if self.mode == "discord":
+            import requests
+            self.requests = requests
 
         self.terminal = sys.stdout
-        self.log = open(log_path, "a")
-        
         self.write(f"====== {self.runner_name} started ======\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         self.start_time = time.time()
 
     def __del__(self):
         elapsed_time = time.time() - self.start_time
         self.write(f"\n====== {self.runner_name} finished ======\nElapsed time: {elapsed_time:.2f} sec\n")
-        self.close()
 
     def flush(self):
         self.terminal.flush()
-        self.log.flush()
 
-    def close(self):
-        self.log.close()
 
     #==== Write functions ====
 
     # logger.write("message")
     def write(self, message):
         self.terminal.write(message)
-        self.log.write(message)
         self.flush()
 
+
+    def warn(self, message):
+        message = f"[WARNING] {message}\n"
+        self.write(message)
 
     def timer_start(self):
         self.timer_start_time = time.time()
